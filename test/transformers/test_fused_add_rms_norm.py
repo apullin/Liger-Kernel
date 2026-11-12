@@ -286,3 +286,71 @@ def test_torch_compile_dynamic_batch_matches_eager(dtype):
             actual = compiled(x, residual)
         for got, want in zip(actual, expected):
             torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "n_rows, hd",
+    [
+        (32768, 64),
+        (32771, 123),  # ragged row block + non-power-of-2 hidden size
+        (32768, 256),
+    ],
+)
+@pytest.mark.parametrize(
+    "dtype, atol, rtol",
+    [
+        (torch.float32, 1e-4, 1e-5),
+        pytest.param(
+            torch.bfloat16,
+            2e-1,
+            2e-2,
+            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "reference, offset, casting_mode",
+    [
+        (LlamaAddRMSNorm, 0.0, "llama"),
+        (GemmaAddRMSNorm, 1.0, "gemma"),
+    ],
+)
+@pytest.mark.parametrize("in_place", [True, False])
+def test_correctness_block_row(n_rows, hd, dtype, atol, rtol, reference, offset, casting_mode, in_place):
+    """Exercise the block-row forward and backward kernels (BLOCK_SIZE <= 256 and n_rows >= 32768)."""
+    _tensor = torch.randn(n_rows, hd, device=device, dtype=dtype)
+    _residual = torch.randn(n_rows, hd, device=device, dtype=dtype)
+    dh = torch.randn(n_rows, hd, device=device, dtype=dtype)
+    dr = torch.randn(n_rows, hd, device=device, dtype=dtype)
+
+    h_ref = _tensor.clone().requires_grad_(True)
+    r_ref = _residual.clone().requires_grad_(True)
+    h_blk = _tensor.clone().requires_grad_(True)
+    r_blk = _residual.clone().requires_grad_(True)
+
+    ref_mod = reference(hidden_size=hd).to(device).to(dtype)
+    blk_mod = (
+        LigerFusedAddRMSNorm(hidden_size=hd, offset=offset, casting_mode=casting_mode, in_place=in_place, row_mode=None)
+        .to(device)
+        .to(dtype)
+    )
+    with torch.no_grad():
+        w = torch.randn(hd, device=device, dtype=dtype)
+        ref_mod.weight.copy_(w)
+        blk_mod.weight.copy_(w)
+
+    out_h_ref, out_r_ref = ref_mod(h_ref, r_ref)
+    out_h_blk, out_r_blk = blk_mod(h_blk, r_blk)
+
+    torch.autograd.backward((out_h_ref, out_r_ref), (dh.clone(), dr.clone()))
+    torch.autograd.backward((out_h_blk, out_r_blk), (dh.clone(), dr.clone()))
+
+    # For large row counts in bf16, dW sums 32k+ rows so relax dW atol proportionally while keeping fp32 tight.
+    dw_atol = 1.0 if dtype == torch.bfloat16 else 5e-3
+    dw_rtol = 5e-2 if dtype == torch.bfloat16 else 1e-4
+
+    assert_verbose_allclose(out_h_ref, out_h_blk, atol=atol, rtol=rtol)
+    assert_verbose_allclose(out_r_ref, out_r_blk, atol=atol, rtol=rtol)
+    assert_verbose_allclose(ref_mod.weight.grad, blk_mod.weight.grad, atol=dw_atol, rtol=dw_rtol)
+    assert_verbose_allclose(h_ref.grad, h_blk.grad, atol=atol, rtol=rtol, max_print=20)
+    assert_verbose_allclose(r_ref.grad, r_blk.grad, atol=atol, rtol=rtol, max_print=20)
