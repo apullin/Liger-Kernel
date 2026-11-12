@@ -3,17 +3,56 @@ import triton
 import triton.language as tl
 
 
-def _cast_and_contiguous(q, k, freqs_complex):
+def _token_row(x):
+    if x.size(1) == 1 and x.is_contiguous():
+        return x, x.stride(0)
+    x = x.contiguous()
+    return x, x.stride(1)
+
+
+def _prepare_freqs_cis(freqs_cis, batch_size: int, seq_len: int):
+    if freqs_cis.is_complex():
+        if freqs_cis.ndim == 4 and freqs_cis.shape[2] == 1:
+            freqs_cis = freqs_cis.squeeze(2)
+        if freqs_cis.ndim == 2:
+            freqs_cis = freqs_cis[:seq_len].unsqueeze(0)
+        elif freqs_cis.ndim == 3:
+            if freqs_cis.shape[0] not in (1, batch_size):
+                raise ValueError(
+                    f"freqs_cis batch dimension must be 1 or batch_size ({batch_size}), got {freqs_cis.shape[0]}"
+                )
+            freqs_cis = freqs_cis[:, :seq_len]
+        else:
+            raise ValueError(f"Unsupported complex freqs_cis shape: {tuple(freqs_cis.shape)}")
+        freqs_real = torch.view_as_real(freqs_cis)
+    else:
+        if freqs_cis.ndim == 3 and freqs_cis.shape[-1] == 2:
+            freqs_real = freqs_cis[:seq_len].unsqueeze(0)
+        elif freqs_cis.ndim == 4 and freqs_cis.shape[-1] == 2:
+            if freqs_cis.shape[0] not in (1, batch_size):
+                raise ValueError(
+                    f"freqs_cis batch dimension must be 1 or batch_size ({batch_size}), got {freqs_cis.shape[0]}"
+                )
+            freqs_real = freqs_cis[:, :seq_len]
+        else:
+            raise ValueError(f"Unsupported real freqs_cis shape: {tuple(freqs_cis.shape)}")
+
+    freqs_real = freqs_real.contiguous()
+    freqs_batch_stride = 0 if freqs_real.shape[0] == 1 else freqs_real.stride(0)
+    freqs_row_stride = freqs_real.stride(1)
+    return freqs_real, freqs_batch_stride, freqs_row_stride
+
+
+def _cast_and_contiguous(q, k):
     # Align dtype: fp32 only when q is fp32; otherwise keep q dtype for perf
     compute_dtype = torch.float32 if q.dtype == torch.float32 else q.dtype
 
     if k.dtype != q.dtype:
         k = k.to(q.dtype)
 
-    q = q.to(compute_dtype).contiguous()
-    k = k.to(compute_dtype).contiguous()
-    freqs_complex = freqs_complex.contiguous()
-    return q, k, freqs_complex
+    q, q_row_stride = _token_row(q.to(compute_dtype))
+    k, k_row_stride = _token_row(k.to(compute_dtype))
+    return q, q_row_stride, k, k_row_stride
 
 
 @triton.jit
@@ -25,6 +64,7 @@ def _llama4_rope_kernel(
     k_row_stride,
     q_head_stride,
     k_head_stride,
+    freqs_batch_stride,
     freqs_row_stride,
     seq_len,
     batch_size,
@@ -53,7 +93,7 @@ def _llama4_rope_kernel(
     base_offset = batch_idx * seq_len + seq_idx
     q_base = q_ptr + base_offset * q_row_stride
     k_base = k_ptr + base_offset * k_row_stride
-    freq_base = seq_idx * freqs_row_stride
+    freq_base = batch_idx * freqs_batch_stride + seq_idx * freqs_row_stride
 
     # Tiling over dim/2
     for d_start in tl.static_range(0, head_dim_half, BLOCK_SIZE):
@@ -107,20 +147,18 @@ def _select_kernel_meta(head_dim_half: int):
 
 
 def llama4_rope_forward(q, k, freqs_cis, BLOCK_SIZE: int = None, imag_sign: float = 1.0):
-    # Save original dtype for casting back
-    original_dtype = q.dtype
+    # Save original dtypes for casting back
+    original_q_dtype = q.dtype
+    original_k_dtype = k.dtype
 
     batch_size, seq_len, n_q_heads, head_dim = q.shape
     _, _, n_k_heads, _ = k.shape
     head_dim_half = head_dim // 2
-    if freqs_cis.is_complex():
-        freqs_cis = freqs_cis.reshape(-1, freqs_cis.shape[-1])
-        if freqs_cis.shape[0] > seq_len:
-            freqs_cis = freqs_cis[:seq_len]
-        freqs_cis = torch.view_as_real(freqs_cis)
 
-    # Cast to appropriate dtype and make contiguous only when needed
-    q, k, freqs_cis = _cast_and_contiguous(q, k, freqs_cis)
+    freqs_real, freqs_batch_stride, freqs_row_stride = _prepare_freqs_cis(freqs_cis, batch_size, seq_len)
+
+    # Cast to appropriate dtype and resolve token row strides
+    q, q_row_stride, k, k_row_stride = _cast_and_contiguous(q, k)
 
     # H100-optimized meta-params
     if BLOCK_SIZE is None:
@@ -137,12 +175,13 @@ def llama4_rope_forward(q, k, freqs_cis, BLOCK_SIZE: int = None, imag_sign: floa
     _llama4_rope_kernel[grid](
         q,
         k,
-        freqs_cis,
-        q.stride(1),
-        k.stride(1),
+        freqs_real,
+        q_row_stride,
+        k_row_stride,
         q.stride(2),
         k.stride(2),
-        freqs_cis.stride(0),
+        freqs_batch_stride,
+        freqs_row_stride,
         seq_len,
         batch_size,
         imag_sign,
@@ -154,11 +193,11 @@ def llama4_rope_forward(q, k, freqs_cis, BLOCK_SIZE: int = None, imag_sign: floa
         num_stages=2,
     )
 
-    # Cast back to original dtype only if it differs from compute dtype
-    if q.dtype != original_dtype:
-        q = q.to(original_dtype)
-    if k.dtype != original_dtype:
-        k = k.to(original_dtype)
+    # Cast back to original dtypes only if they differ from compute dtype
+    if q.dtype != original_q_dtype:
+        q = q.to(original_q_dtype)
+    if k.dtype != original_k_dtype:
+        k = k.to(original_k_dtype)
 
     return q, k
 
