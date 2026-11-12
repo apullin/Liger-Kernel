@@ -18,7 +18,7 @@ class LigerLayerNorm(nn.Module):
         self,
         hidden_size,
         eps=1e-6,
-        bias=False,
+        bias=True,
         init_fn="ones",
         impl=None,
         mode=None,
@@ -32,7 +32,10 @@ class LigerLayerNorm(nn.Module):
         self.hidden_size = hidden_size
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size) if init_fn == "ones" else torch.zeros(hidden_size))
-        self.bias = nn.Parameter(torch.randn(hidden_size) if bias else torch.zeros(hidden_size))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(hidden_size))
+        else:
+            self.register_parameter("bias", None)
         self.variance_epsilon = eps
         if impl is None and backend is not None:
             impl = backend
@@ -60,7 +63,7 @@ class LigerLayerNorm(nn.Module):
 
     def extra_repr(self):
         return (
-            f"{self.hidden_size}, eps={self.eps}, "
+            f"{self.hidden_size}, eps={self.eps}, bias={self.bias is not None}, "
             f"impl={getattr(self, 'impl', None)!r}, "
             f"mode={getattr(self, 'mode', None)!r}"
         )

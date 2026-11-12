@@ -380,7 +380,7 @@ def liger_tvd(
     )
 
 
-def liger_layer_norm(X, W, B, eps):
+def liger_layer_norm(X, W, B=None, eps=1e-6):
     return LigerLayerNormFunction.apply(X, W, B, eps)
 
 

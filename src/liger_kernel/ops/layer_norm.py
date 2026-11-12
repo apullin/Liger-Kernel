@@ -40,6 +40,7 @@ def _layer_norm_forward_kernel(
     n_cols,
     eps,
     BLOCK_SIZE: tl.constexpr,
+    HAS_BIAS: tl.constexpr = True,
 ):
     """
     References:
@@ -52,9 +53,10 @@ def _layer_norm_forward_kernel(
 
     # Pre-load weights and bias in fp32 to avoid repeated conversions
     W_row = tl.load(W_ptr + col_offsets, mask=mask, other=0.0)
-    B_row = tl.load(B_ptr + col_offsets, mask=mask, other=0.0)
     W_f32 = W_row.to(tl.float32)
-    B_f32 = B_row.to(tl.float32)
+    if HAS_BIAS:
+        B_row = tl.load(B_ptr + col_offsets, mask=mask, other=0.0)
+        B_f32 = B_row.to(tl.float32)
 
     # Calculate pointers for this row
     row_X_ptr = X_ptr + row_idx * X_row_stride
@@ -80,7 +82,9 @@ def _layer_norm_forward_kernel(
 
     # Fused normalization and affine transformation
     # Y = (X - mean) * rstd * W + B = X_centered * rstd * W + B
-    Y_f32 = X_centered * rstd * W_f32 + B_f32
+    Y_f32 = X_centered * rstd * W_f32
+    if HAS_BIAS:
+        Y_f32 = Y_f32 + B_f32
 
     # Store output (single conversion back to original dtype)
     tl.store(row_Y_ptr + col_offsets, Y_f32.to(X_row.dtype), mask=mask)
@@ -174,12 +178,12 @@ def _layer_norm_backward_kernel(
         tl.store(DB_ptr + row_block_id * stride_db + cols, db_row, mask=mask)
 
 
-def layer_norm_forward(X, W, B, eps):
+def layer_norm_forward(X, W, B=None, eps=1e-6):
     """
     Args:
         X: Input tensor of shape (..., hidden_size)
         W: Weight tensor of shape (hidden_size,)
-        B: Bias tensor of shape (hidden_size,)
+        B: Optional bias tensor of shape (hidden_size,) or None
         eps: Small constant for numerical stability
 
     Returns:
@@ -204,6 +208,12 @@ def layer_norm_forward(X, W, B, eps):
             f"Incompatible dimensions: input feature size (X.shape[1]={X.shape[1]}) "
             f"must match weight size (W.shape[0]={W.shape[0]})"
         )
+    has_bias = B is not None
+    if has_bias and X.shape[1] != B.shape[0]:
+        raise ValueError(
+            f"Incompatible dimensions: input feature size (X.shape[1]={X.shape[1]}) "
+            f"must match bias size (B.shape[0]={B.shape[0]})"
+        )
 
     # XPU-specific optimization
     kernel_args = {}
@@ -220,7 +230,7 @@ def layer_norm_forward(X, W, B, eps):
         W,
         W.stride(0),
         B,
-        B.stride(0),
+        B.stride(0) if has_bias else 0,
         Mean,
         Mean.stride(0),
         RSTD,
@@ -228,6 +238,7 @@ def layer_norm_forward(X, W, B, eps):
         n_cols,
         eps,
         BLOCK_SIZE=BLOCK_SIZE,
+        HAS_BIAS=has_bias,
         num_warps=num_warps,
         **kernel_args,
     )
@@ -241,7 +252,7 @@ def layer_norm_backward(dY, X, W, B, Mean, RSTD, needs_dw=None, needs_db=None):
         dY: Gradient of output
         X: Input tensor
         W: Weight tensor
-        B: Bias tensor
+        B: Optional bias tensor or None
         Mean: Pre-computed mean
         RSTD: Pre-computed reciprocal standard deviation
         needs_dw: Whether to compute gradient of weight
@@ -256,7 +267,7 @@ def layer_norm_backward(dY, X, W, B, Mean, RSTD, needs_dw=None, needs_db=None):
     n_rows, n_cols = dY.shape
 
     compute_dw = True if needs_dw is None else needs_dw
-    compute_db = True if needs_db is None else needs_db
+    compute_db = (B is not None) and (True if needs_db is None else needs_db)
 
     sm_count = 1
     if X.device.type == "cuda":
@@ -322,7 +333,7 @@ def layer_norm_backward(dY, X, W, B, Mean, RSTD, needs_dw=None, needs_db=None):
 class LigerLayerNormFunction(torch.autograd.Function):
     @staticmethod
     @ensure_contiguous
-    def forward(ctx, X, W, B, eps):
+    def forward(ctx, X, W, B=None, eps=1e-6):
         Y, X, Mean, RSTD, BLOCK_SIZE, num_warps = layer_norm_forward(X, W, B, eps)
         ctx.save_for_backward(X, W, B, Mean, RSTD)
         return Y
@@ -332,6 +343,6 @@ class LigerLayerNormFunction(torch.autograd.Function):
     def backward(ctx, dY):
         X, W, B, Mean, RSTD = ctx.saved_tensors
         needs_dw = ctx.needs_input_grad[1]
-        needs_db = ctx.needs_input_grad[2]
+        needs_db = B is not None and ctx.needs_input_grad[2]
         DX, DW, DB = layer_norm_backward(dY, X, W, B, Mean, RSTD, needs_dw=needs_dw, needs_db=needs_db)
         return DX, DW, DB, None
