@@ -312,3 +312,67 @@ def test_multidimensional_input(shape):
 
     assert x.grad is not None, "Gradient should be computed for input"
     assert x.grad.shape == shape, f"Gradient shape {x.grad.shape} != input shape {shape}"
+
+
+@pytest.mark.parametrize(
+    "n_rows, hd",
+    [
+        (4096, 16),
+        (4103, 61),  # ragged row block + odd hidden size
+        (32771, 123),
+        (65537, 256),
+    ],
+)
+@pytest.mark.parametrize(
+    "dtype, atol, rtol",
+    [
+        (torch.float32, 1e-3, 1e-4),
+        pytest.param(
+            torch.bfloat16,
+            2e-2,
+            2e-2,
+            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("in_place", [True, False])
+def test_correctness_block_row(n_rows, hd, dtype, atol, rtol, in_place):
+    """Exercise the block-row PolyNorm kernels (BLOCK_SIZE <= 256 and n_rows >= 4096)."""
+    _tensor = torch.randn(n_rows, hd, device=device, dtype=dtype)
+    grad_output = torch.randn(n_rows, hd, device=device, dtype=dtype)
+
+    # Evaluate the reference in fp32 on the quantized inputs (matching the kernel's fp32 accumulation,
+    # since summing millions of bf16 terms in bf16 drifts heavily due to mantissa truncation).
+    x_ref = _tensor.detach().to(torch.float32).clone().requires_grad_(True)
+    x_blk = _tensor.detach().clone().requires_grad_(True)
+
+    blk_mod = LigerPolyNorm(eps=1e-6, in_place=in_place, row_mode=None).to(device).to(dtype)
+    ref_mod = NaivePolyNorm(eps=1e-6).to(device)
+    with torch.no_grad():
+        ref_mod.weight.copy_(blk_mod.weight.float())
+        ref_mod.bias.copy_(blk_mod.bias.float())
+
+    y_ref = ref_mod(x_ref).to(dtype)
+    y_blk = blk_mod(x_blk)
+    y_ref.backward(grad_output.clone())
+    y_blk.backward(grad_output.clone())
+
+    assert_verbose_allclose(y_ref, y_blk, atol=atol, rtol=rtol)
+    assert_verbose_allclose(x_ref.grad.to(dtype), x_blk.grad, atol=atol, rtol=rtol, max_print=20)
+    assert_verbose_allclose(ref_mod.weight.grad.to(dtype), blk_mod.weight.grad, atol=atol, rtol=rtol)
+    assert_verbose_allclose(ref_mod.bias.grad.to(dtype), blk_mod.bias.grad, atol=atol, rtol=rtol)
+
+
+@pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU")
+def test_poly_norm_bias_grad_preserves_bias_dtype():
+    """dB must take B.dtype rather than W.dtype (avoiding rounding fp32 bias grads through bf16)."""
+    rows, cols = 257, 16
+    x = torch.ones(rows, cols, device=device, dtype=torch.bfloat16, requires_grad=True)
+    w = torch.zeros(3, device=device, dtype=torch.bfloat16, requires_grad=True)
+    b = torch.zeros((), device=device, dtype=torch.float32, requires_grad=True)
+
+    y = liger_poly_norm(x, w, b, eps=1e-6, in_place=False)
+    _, dw, db = torch.autograd.grad(y, (x, w, b), torch.ones_like(y))
+    assert dw.dtype == torch.bfloat16
+    assert db.dtype == torch.float32
+    assert_verbose_allclose(db, torch.full_like(b, rows * cols))

@@ -1,3 +1,4 @@
+import math
 import operator
 
 import torch
@@ -6,10 +7,17 @@ import triton.language as tl
 
 from liger_kernel.ops.utils import calculate_settings
 from liger_kernel.ops.utils import compare_version
+from liger_kernel.ops.utils import device_context
 from liger_kernel.ops.utils import ensure_contiguous
 from liger_kernel.ops.utils import get_npu_core_count
 from liger_kernel.ops.utils import set_large_grf_mode
 from liger_kernel.utils import is_npu_available
+
+_BLOCK_ROW_MAX_BLOCK_SIZE = 256
+_BLOCK_ROW_MIN_ROWS = 4096
+_BLOCK_ROW_ELEMENTS = 4096
+_BLOCK_ROW_MAX_ROWS = 64
+_BLOCK_ROW_BWD_PROGRAMS_PER_SM = 4
 
 if compare_version("triton", operator.ge, "3.0.0") and not is_npu_available():
     try:
@@ -202,7 +210,169 @@ def _poly_norm_backward_kernel(
     tl.store(dB_ptr + row_block_id, dB_acc)
 
 
-def poly_norm_forward(X, W, B, eps=1e-6):
+@triton.jit
+def _block_poly_norm_forward_kernel(
+    Y_ptr,
+    Y_row_stride,
+    X_ptr,
+    X_row_stride,
+    W_ptr,
+    B_ptr,
+    RSTD_ptr,
+    RSTD_row_stride,
+    n_rows,
+    n_cols,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_ROW: tl.constexpr,
+):
+    """
+    Block-row PolyNorm forward kernel for narrow feature widths (BLOCK_SIZE <= 256).
+    """
+    row_idx = tl.program_id(0).to(tl.int64) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    row_mask = row_idx < n_rows
+    col_mask = col_offsets < n_cols
+    mask = row_mask[:, None] & col_mask[None, :]
+
+    X_row = tl.load(
+        X_ptr + row_idx[:, None] * X_row_stride + col_offsets[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    w0 = tl.load(W_ptr + 0).to(tl.float32)
+    w1 = tl.load(W_ptr + 1).to(tl.float32)
+    w2 = tl.load(W_ptr + 2).to(tl.float32)
+    b = tl.load(B_ptr).to(tl.float32)
+
+    eps = tl.cast(eps, tl.float32)
+
+    X_pow2 = X_row * X_row
+    X_pow3 = X_pow2 * X_row
+
+    mean_square_3 = tl.sum(X_pow3 * X_pow3, axis=1) / n_cols
+    rstd_3 = rsqrt(mean_square_3 + eps)
+    norm_x3 = X_pow3 * rstd_3[:, None]
+
+    mean_square_2 = tl.sum(X_pow2 * X_pow2, axis=1) / n_cols
+    rstd_2 = rsqrt(mean_square_2 + eps)
+    norm_x2 = X_pow2 * rstd_2[:, None]
+
+    mean_square_1 = tl.sum(X_pow2, axis=1) / n_cols
+    rstd_1 = rsqrt(mean_square_1 + eps)
+    norm_x1 = X_row * rstd_1[:, None]
+
+    rstd_base = RSTD_ptr + row_idx * RSTD_row_stride
+    tl.store(rstd_base + 0, rstd_3, mask=row_mask)
+    tl.store(rstd_base + 1, rstd_2, mask=row_mask)
+    tl.store(rstd_base + 2, rstd_1, mask=row_mask)
+
+    Y_row = w0 * norm_x3 + w1 * norm_x2 + w2 * norm_x1 + b
+    tl.store(
+        Y_ptr + row_idx[:, None] * Y_row_stride + col_offsets[None, :],
+        Y_row,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _block_poly_norm_backward_kernel(
+    dY_ptr,
+    dY_row_stride,
+    dX_ptr,
+    dX_row_stride,
+    X_ptr,
+    X_row_stride,
+    W_ptr,
+    RSTD_ptr,
+    RSTD_row_stride,
+    dW_ptr,
+    dW_row_stride,
+    dB_ptr,
+    n_rows,
+    n_cols,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_ROW: tl.constexpr,
+):
+    """
+    Block-row persistent PolyNorm backward kernel for narrow feature widths (BLOCK_SIZE <= 256).
+    """
+    pid = tl.program_id(0).to(tl.int64)
+    num_programs = tl.num_programs(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    col_mask = col_offsets < n_cols
+
+    dW0_acc = 0.0
+    dW1_acc = 0.0
+    dW2_acc = 0.0
+    dB_acc = 0.0
+
+    w0 = tl.load(W_ptr + 0).to(tl.float32)
+    w1 = tl.load(W_ptr + 1).to(tl.float32)
+    w2 = tl.load(W_ptr + 2).to(tl.float32)
+
+    for start in range(pid * BLOCK_ROW, n_rows, num_programs * BLOCK_ROW):
+        row_idx = start + tl.arange(0, BLOCK_ROW)
+        row_mask = row_idx < n_rows
+        mask = row_mask[:, None] & col_mask[None, :]
+
+        dY_row = tl.load(
+            dY_ptr + row_idx[:, None] * dY_row_stride + col_offsets[None, :],
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        X_row = tl.load(
+            X_ptr + row_idx[:, None] * X_row_stride + col_offsets[None, :],
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        rstd_base = RSTD_ptr + row_idx * RSTD_row_stride
+        rstd_3 = tl.load(rstd_base + 0, mask=row_mask, other=0.0).to(tl.float32)
+        rstd_2 = tl.load(rstd_base + 1, mask=row_mask, other=0.0).to(tl.float32)
+        rstd_1 = tl.load(rstd_base + 2, mask=row_mask, other=0.0).to(tl.float32)
+
+        X_pow2 = X_row * X_row
+        X_pow3 = X_pow2 * X_row
+
+        dB_acc += tl.sum(tl.where(mask, dY_row, 0.0))
+
+        S_3 = tl.sum(dY_row * X_pow3, axis=1)
+        rstd_3_col = rstd_3[:, None]
+        grad_x_3 = w0 * (
+            3.0 * X_pow2 * rstd_3_col * dY_row
+            - (3.0 / n_cols) * X_pow3 * X_pow2 * (rstd_3 * rstd_3 * rstd_3 * S_3)[:, None]
+        )
+
+        S_2 = tl.sum(dY_row * X_pow2, axis=1)
+        rstd_2_col = rstd_2[:, None]
+        grad_x_2 = w1 * (
+            2.0 * X_row * rstd_2_col * dY_row - (2.0 / n_cols) * X_pow3 * (rstd_2 * rstd_2 * rstd_2 * S_2)[:, None]
+        )
+
+        S_1 = tl.sum(dY_row * X_row, axis=1)
+        rstd_1_col = rstd_1[:, None]
+        grad_x_1 = w2 * (rstd_1_col * dY_row - (1.0 / n_cols) * X_row * (rstd_1 * rstd_1 * rstd_1 * S_1)[:, None])
+
+        dW0_acc += tl.sum(tl.where(row_mask, rstd_3 * S_3, 0.0), axis=0)
+        dW1_acc += tl.sum(tl.where(row_mask, rstd_2 * S_2, 0.0), axis=0)
+        dW2_acc += tl.sum(tl.where(row_mask, rstd_1 * S_1, 0.0), axis=0)
+
+        dX_row = grad_x_3 + grad_x_2 + grad_x_1
+        tl.store(
+            dX_ptr + row_idx[:, None] * dX_row_stride + col_offsets[None, :],
+            dX_row,
+            mask=mask,
+        )
+
+    tl.store(dW_ptr + pid * dW_row_stride + 0, dW0_acc)
+    tl.store(dW_ptr + pid * dW_row_stride + 1, dW1_acc)
+    tl.store(dW_ptr + pid * dW_row_stride + 2, dW2_acc)
+    tl.store(dB_ptr + pid, dB_acc)
+
+
+def poly_norm_forward(X, W, B, eps=1e-6, row_mode=None):
     """
     PolyNorm Forward Pass
 
@@ -211,6 +381,7 @@ def poly_norm_forward(X, W, B, eps=1e-6):
         W: weight tensor of shape (3,) for [w0, w1, w2]
         B: bias scalar tensor
         eps: epsilon for numerical stability
+        row_mode: if truthy, force the single-row-per-program path
 
     Returns:
         Y: output tensor of same shape as X
@@ -238,27 +409,47 @@ def poly_norm_forward(X, W, B, eps=1e-6):
     if X.device.type == "xpu":
         set_large_grf_mode(kernel_args)
 
-    # Launch kernel
-    _poly_norm_forward_kernel[(n_rows,)](
-        Y,
-        Y.stride(0),
-        X,
-        X.stride(0),
-        W,
-        B,
-        RSTD,
-        RSTD.stride(0),
-        n_cols,
-        eps,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-        **kernel_args,
-    )
+    with device_context(X.device):
+        if BLOCK_SIZE > _BLOCK_ROW_MAX_BLOCK_SIZE or n_rows < _BLOCK_ROW_MIN_ROWS or row_mode:
+            _poly_norm_forward_kernel[(n_rows,)](
+                Y,
+                Y.stride(0),
+                X,
+                X.stride(0),
+                W,
+                B,
+                RSTD,
+                RSTD.stride(0),
+                n_cols,
+                eps,
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=num_warps,
+                **kernel_args,
+            )
+        else:
+            BLOCK_ROW = min(_BLOCK_ROW_MAX_ROWS, _BLOCK_ROW_ELEMENTS // max(1, BLOCK_SIZE))
+            _block_poly_norm_forward_kernel[(triton.cdiv(n_rows, BLOCK_ROW),)](
+                Y,
+                Y.stride(0),
+                X,
+                X.stride(0),
+                W,
+                B,
+                RSTD,
+                RSTD.stride(0),
+                n_rows,
+                n_cols,
+                eps,
+                BLOCK_SIZE=BLOCK_SIZE,
+                BLOCK_ROW=BLOCK_ROW,
+                num_warps=num_warps,
+                **kernel_args,
+            )
 
     return Y.view(*shape), X, RSTD, BLOCK_SIZE, num_warps
 
 
-def poly_norm_backward(dY, X, W, RSTD, BLOCK_SIZE, num_warps, in_place):
+def poly_norm_backward(dY, X, W, RSTD, BLOCK_SIZE, num_warps, in_place, b_dtype=None, row_mode=None):
     """
     PolyNorm Backward Pass
 
@@ -270,6 +461,8 @@ def poly_norm_backward(dY, X, W, RSTD, BLOCK_SIZE, num_warps, in_place):
         BLOCK_SIZE: block size from forward
         num_warps: number of warps from forward
         in_place: whether to in-place modify dY to store dX (saves memory)
+        b_dtype: dtype for bias gradient (defaults to W.dtype if omitted)
+        row_mode: if truthy, force the single-row-per-program path
 
     Returns:
         dX: gradient w.r.t. input
@@ -280,9 +473,6 @@ def poly_norm_backward(dY, X, W, RSTD, BLOCK_SIZE, num_warps, in_place):
     dim = shape[-1]
     dY = dY.view(-1, dim)
     n_rows, n_cols = dY.shape
-
-    # Get number of SMs for parallelization
-    import math
 
     sm_count = 1
     if X.device.type == "cuda":
@@ -298,43 +488,70 @@ def poly_norm_backward(dY, X, W, RSTD, BLOCK_SIZE, num_warps, in_place):
     else:
         dX = torch.zeros_like(dY)
 
-    _dW = torch.empty((sm_count, 3), dtype=torch.float32, device=W.device)
-    _dB = torch.empty((sm_count,), dtype=torch.float32, device=W.device)
+    use_single_row = BLOCK_SIZE > _BLOCK_ROW_MAX_BLOCK_SIZE or n_rows < _BLOCK_ROW_MIN_ROWS or bool(row_mode)
+    if use_single_row:
+        n_programs = sm_count
+    else:
+        BLOCK_ROW = min(_BLOCK_ROW_MAX_ROWS, _BLOCK_ROW_ELEMENTS // max(1, BLOCK_SIZE))
+        n_programs = max(1, min(sm_count * _BLOCK_ROW_BWD_PROGRAMS_PER_SM, triton.cdiv(n_rows, BLOCK_ROW)))
 
-    rows_per_program = math.ceil(n_rows / sm_count)
-    grid = (sm_count,)
+    _dW = torch.empty((n_programs, 3), dtype=torch.float32, device=W.device)
+    _dB = torch.empty((n_programs,), dtype=torch.float32, device=W.device)
 
     # XPU-specific optimization
     kernel_args = {}
     if X.device.type == "xpu":
         set_large_grf_mode(kernel_args)
 
-    # Launch backward kernel
-    _poly_norm_backward_kernel[grid](
-        dY,
-        dY.stride(0),
-        dX,
-        dX.stride(0),
-        X,
-        X.stride(0),
-        W,
-        RSTD,
-        RSTD.stride(0),
-        _dW,
-        _dW.stride(0),
-        _dB,
-        n_rows,
-        n_cols,
-        rows_per_program,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-        **kernel_args,
-    )
+    with device_context(X.device):
+        if use_single_row:
+            rows_per_program = math.ceil(n_rows / sm_count)
+            _poly_norm_backward_kernel[(n_programs,)](
+                dY,
+                dY.stride(0),
+                dX,
+                dX.stride(0),
+                X,
+                X.stride(0),
+                W,
+                RSTD,
+                RSTD.stride(0),
+                _dW,
+                _dW.stride(0),
+                _dB,
+                n_rows,
+                n_cols,
+                rows_per_program,
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=num_warps,
+                **kernel_args,
+            )
+        else:
+            _block_poly_norm_backward_kernel[(n_programs,)](
+                dY,
+                dY.stride(0),
+                dX,
+                dX.stride(0),
+                X,
+                X.stride(0),
+                W,
+                RSTD,
+                RSTD.stride(0),
+                _dW,
+                _dW.stride(0),
+                _dB,
+                n_rows,
+                n_cols,
+                BLOCK_SIZE=BLOCK_SIZE,
+                BLOCK_ROW=BLOCK_ROW,
+                num_warps=num_warps,
+                **kernel_args,
+            )
 
-    # Reduce gradients across SMs
+    # Reduce gradients across programs
     dX = dX.view(*shape)
     dW = _dW.sum(dim=0).to(W.dtype)
-    dB = _dB.sum().to(W.dtype)
+    dB = _dB.sum().to(W.dtype if b_dtype is None else b_dtype)
 
     return dX, dW, dB
 
@@ -353,7 +570,7 @@ class LigerPolyNormFunction(torch.autograd.Function):
 
     @staticmethod
     @ensure_contiguous
-    def forward(ctx, X, W, B, eps=1e-6, in_place=True):
+    def forward(ctx, X, W, B, eps=1e-6, in_place=True, row_mode=None):
         """
         Args:
             X: input tensor of shape (B, T, H) or (BxT, H)
@@ -361,14 +578,17 @@ class LigerPolyNormFunction(torch.autograd.Function):
             B: bias scalar
             eps: epsilon for numerical stability
             in_place: whether to in-place modify grad_output in backward (saves memory)
+            row_mode: if truthy, force the single-row-per-program path
 
         Returns:
             Y: output tensor of same shape as X
         """
-        Y, X, RSTD, BLOCK_SIZE, num_warps = poly_norm_forward(X, W, B, eps)
+        Y, X, RSTD, BLOCK_SIZE, num_warps = poly_norm_forward(X, W, B, eps, row_mode=row_mode)
         ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.num_warps = num_warps
         ctx.in_place = in_place
+        ctx.row_mode = row_mode
+        ctx.b_dtype = B.dtype
         ctx.save_for_backward(X, W, RSTD)
         return Y
 
@@ -383,5 +603,15 @@ class LigerPolyNormFunction(torch.autograd.Function):
             dX, dW, dB: gradients w.r.t. X, W, B
         """
         X, W, RSTD = ctx.saved_tensors
-        dX, dW, dB = poly_norm_backward(grad_output, X, W, RSTD, ctx.BLOCK_SIZE, ctx.num_warps, ctx.in_place)
-        return dX, dW, dB, None, None
+        dX, dW, dB = poly_norm_backward(
+            grad_output,
+            X,
+            W,
+            RSTD,
+            ctx.BLOCK_SIZE,
+            ctx.num_warps,
+            ctx.in_place,
+            b_dtype=ctx.b_dtype,
+            row_mode=ctx.row_mode,
+        )
+        return dX, dW, dB, None, None, None
