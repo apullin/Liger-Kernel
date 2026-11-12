@@ -109,3 +109,80 @@ def test_liger_group_norm_low_precision_statistics(shape, num_groups, offset, dt
 
     assert torch.isfinite(liger_output).all()
     assert torch.allclose(liger_output.float(), torch_output, atol=atol, rtol=rtol)
+
+
+def test_liger_group_norm_2d_and_repr():
+    gn = LigerGroupNorm(8, 2, eps=1e-6).to(device)
+    assert "num_channels=8" in repr(gn) and "num_groups=2" in repr(gn)
+
+    x1 = torch.randn(4, 8, device=device, dtype=torch.float32, requires_grad=True)
+    x2 = x1.detach().clone().requires_grad_(True)
+    ref = torch.nn.GroupNorm(2, 8, eps=1e-6).to(device)
+    with torch.no_grad():
+        ref.weight.copy_(gn.weight)
+        ref.bias.copy_(gn.bias)
+
+    y1 = gn(x1)
+    y2 = ref(x2)
+    assert torch.allclose(y1, y2, atol=1e-5, rtol=1e-5)
+    dy = torch.randn_like(y1)
+    y1.backward(dy)
+    y2.backward(dy.clone())
+    assert torch.allclose(x1.grad, x2.grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "dtype, atol, rtol",
+    [
+        (torch.float32, 1e-4, 1e-4),
+        (torch.float16, 1e-2, 1e-2),
+        pytest.param(
+            torch.bfloat16,
+            2e-2,
+            2e-2,
+            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_liger_group_norm_large_spatial_and_channels_last(dtype, atol, rtol, channels_last):
+    """Exercise split-spatial NCHW and native 4D channels_last forward + backward paths."""
+    torch.manual_seed(0)
+    shape = (2, 24, 1, 16389)  # non-power-of-2 spatial length >= 4096, small N*G
+    num_channels, num_groups = 24, 8
+
+    x_base = (torch.randn(*shape, device=device) + 8.0).to(dtype)
+    dy_base = torch.randn(*shape, device=device, dtype=dtype)
+    if channels_last:
+        x_base = x_base.contiguous(memory_format=torch.channels_last)
+        dy_base = dy_base.contiguous(memory_format=torch.channels_last)
+
+    x_lig = x_base.clone().requires_grad_(True)
+    x_ref = x_base.detach().to(torch.float32).clone().requires_grad_(True)
+
+    gn_lig = LigerGroupNorm(num_channels, num_groups, eps=1e-5).to(device).to(dtype)
+    w_ref = gn_lig.weight.detach().to(torch.float32).clone().requires_grad_(True)
+    b_ref = gn_lig.bias.detach().to(torch.float32).clone().requires_grad_(True)
+
+    y_lig = gn_lig(x_lig)
+    if channels_last:
+        assert y_lig.is_contiguous(memory_format=torch.channels_last)
+    y_ref = torch.nn.functional.group_norm(x_ref, num_groups, w_ref, b_ref, eps=1e-5)
+
+    assert torch.isfinite(y_lig).all()
+    assert torch.allclose(y_lig.float(), y_ref, atol=atol, rtol=rtol)
+
+    y_lig.backward(dy_base)
+    y_ref.backward(dy_base.float())
+
+    if channels_last:
+        assert x_lig.grad.is_contiguous(memory_format=torch.channels_last)
+    assert torch.isfinite(x_lig.grad).all()
+    assert torch.allclose(x_lig.grad.float(), x_ref.grad, atol=atol, rtol=rtol)
+    assert torch.allclose(
+        gn_lig.weight.grad.float(), w_ref.grad, atol=5e-2 if dtype != torch.float32 else 1e-3, rtol=2e-2
+    )
+    if dtype != torch.float16:  # sum of 32k elements can exceed fp16 range on bias grad
+        assert torch.allclose(
+            gn_lig.bias.grad.float(), b_ref.grad, atol=5e-2 if dtype != torch.float32 else 1e-3, rtol=2e-2
+        )
